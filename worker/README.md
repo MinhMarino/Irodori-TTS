@@ -1,6 +1,10 @@
 # Irodori TTS RunPod Worker
 
-Serverless worker for **Qwen3-TTS 12Hz 1.7B** with two modes:
+Serverless worker for **Qwen3-TTS 12Hz 1.7B** with two modes.
+
+Cold-start notes: attach both models as Runpod **cached models**, use FlashBoot, keep `PRELOAD_MODELS=none` (lazy GPU load). See [`scripts/create-runpod-endpoint.md`](../scripts/create-runpod-endpoint.md).
+
+## Modes
 
 | `mode` | Model | Required fields |
 |---|---|---|
