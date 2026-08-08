@@ -1,5 +1,7 @@
 # RunPod Endpoint — cold-start optimized
 
+**Live endpoint ID:** `3gq6tivo3ms4ls`  
+Console: https://console.runpod.io/serverless/user/endpoint/3gq6tivo3ms4ls  
 Image: `ghcr.io/minhmarino/irodori-tts-worker:1.7b-dual`
 
 ## Chiến lược chống cold start
