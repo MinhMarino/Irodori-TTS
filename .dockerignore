@@ -1,0 +1,11 @@
+.git
+.gitignore
+output/*
+!output/.gitkeep
+models/*
+!models/.gitkeep
+**/__pycache__
+*.pyc
+.env
+*.md
+.DS_Store

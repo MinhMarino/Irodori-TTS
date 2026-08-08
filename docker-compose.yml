@@ -1,0 +1,29 @@
+services:
+  irodori-tts:
+    build: .
+    container_name: irodori-tts
+    ports:
+      - "8000:8000"
+    environment:
+      TTS_MODEL: Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice
+      # Apple Silicon Docker = CPU. Trên máy NVIDIA: đặt TTS_DEVICE=cuda
+      TTS_DEVICE: ${TTS_DEVICE:-cpu}
+      HF_HOME: /data/hf
+      HF_HUB_CACHE: /data/hf/hub
+      # Tuỳ chọn: token Hugging Face nếu bị rate-limit
+      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-}
+    volumes:
+      - hf-cache:/data/hf
+      - ./output:/app/output
+    restart: unless-stopped
+    # Uncomment khi chạy trên máy có NVIDIA GPU + nvidia-container-toolkit:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+volumes:
+  hf-cache:
