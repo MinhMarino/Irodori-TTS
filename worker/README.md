@@ -1,8 +1,15 @@
 # Irodori TTS RunPod Worker
 
-Serverless worker for **Qwen3-TTS 12Hz 1.7B** with two modes.
+Serverless worker for **Qwen3-TTS 12Hz 1.7B** — CustomVoice (primary) + VoiceDesign (lazy).
 
-Cold-start notes: attach both models as Runpod **cached models**, use FlashBoot, keep `PRELOAD_MODELS=none` (lazy GPU load). See [`scripts/create-runpod-endpoint.md`](../scripts/create-runpod-endpoint.md).
+Latency guide: [`scripts/create-runpod-endpoint.md`](../scripts/create-runpod-endpoint.md).
+
+## Architecture (fast path)
+
+1. Endpoint keeps **1 warm worker** (`workersMin=1`).
+2. RunPod **Cached model** = CustomVoice only (1 model / endpoint limit).
+3. Worker **preloads + warms** CustomVoice at boot.
+4. VoiceDesign loads on first use (slower).
 
 ## Modes
 
@@ -11,9 +18,16 @@ Cold-start notes: attach both models as Runpod **cached models**, use FlashBoot,
 | `custom_voice` | CustomVoice | `text`, `language`, `speaker` (+ optional `instruct`) |
 | `voice_design` | VoiceDesign | `text`, `language`, `instruct` |
 
-## Request example
+## Env
 
-### CustomVoice
+| Var | Default | Notes |
+|---|---|---|
+| `PRELOAD_MODELS` | `custom_voice` | `none` / `custom_voice` / `voice_design` / `both` |
+| `WARMUP_ON_LOAD` | `1` | Tiny generate after load |
+| `STRICT_LOCAL_CACHE` | `0` | `1` = fail if cache missing (no Hub download) |
+| `HF_CACHE_ROOT` | `/runpod-volume/huggingface-cache/hub` | RunPod model cache mount |
+
+## Request
 
 ```json
 {
@@ -21,47 +35,22 @@ Cold-start notes: attach both models as Runpod **cached models**, use FlashBoot,
     "mode": "custom_voice",
     "text": "Hello from Irodori.",
     "language": "English",
-    "speaker": "Ryan",
-    "instruct": "Speak cheerfully."
+    "speaker": "Ryan"
   }
 }
 ```
 
-### VoiceDesign
+## Response extras
 
 ```json
 {
-  "input": {
-    "mode": "voice_design",
-    "text": "哥哥，你回来啦！",
-    "language": "Chinese",
-    "instruct": "Cute playful young female voice, high pitch, affectionate tone."
-  }
-}
-```
-
-## Response
-
-```json
-{
-  "mode": "custom_voice",
-  "language": "English",
-  "speaker": "Ryan",
-  "sample_rate": 24000,
-  "format": "wav",
+  "warm": true,
+  "cache_hit": true,
+  "timings_ms": { "model_load": 0, "infer": 7900, "handler_total": 8100 },
   "audio_base64": "UklGRi..."
 }
 ```
 
-## Speakers (CustomVoice)
+## Speakers
 
 Vivian, Serena, Uncle_Fu, Dylan, Eric, Ryan, Aiden, Ono_Anna, Sohee
-
-## Call API
-
-```bash
-curl -X POST "https://api.runpod.ai/v2/$ENDPOINT_ID/runsync" \
-  -H "Authorization: Bearer $RUNPOD_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"input":{"mode":"custom_voice","text":"Hi","language":"English","speaker":"Ryan"}}'
-```

@@ -1,10 +1,10 @@
 """RunPod Serverless worker — Qwen3-TTS 1.7B (CustomVoice + VoiceDesign).
 
-Cold-start optimizations:
-- Prefer Runpod model cache at /runpod-volume/huggingface-cache/hub
-- Fall back to baked /models paths, then Hugging Face hub id
-- Lazy-load each mode on first use (keeps unused model off GPU)
-- Optional PRELOAD_MODELS to warm selected modes at boot
+Latency-oriented structure:
+- Resolve RunPod model cache at /runpod-volume/huggingface-cache/hub first
+- Prefer PRELOAD_MODELS=custom_voice so the warm worker is inference-ready
+- Lazy-load VoiceDesign only when requested (second model is not cached)
+- Return timing fields so clients can see queue vs load vs infer
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import base64
 import io
 import logging
 import os
+import time
 from typing import Any
 
 import numpy as np
@@ -30,15 +31,27 @@ VOICE_DESIGN_MODEL = os.getenv(
     "VOICE_DESIGN_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
 )
 # none | custom_voice | voice_design | both
-PRELOAD_MODELS = os.getenv("PRELOAD_MODELS", "none").strip().lower()
-HF_CACHE_ROOT = os.getenv(
-    "HF_CACHE_ROOT", "/runpod-volume/huggingface-cache/hub"
-)
+# Latency profile default: preload the primary CustomVoice model.
+PRELOAD_MODELS = os.getenv("PRELOAD_MODELS", "custom_voice").strip().lower()
+HF_CACHE_ROOT = os.getenv("HF_CACHE_ROOT", "/runpod-volume/huggingface-cache/hub")
 BAKED_MODEL_ROOT = os.getenv("BAKED_MODEL_ROOT", "/models")
-# Extend init window for large GPU load (seconds)
+# If 1: refuse Hub download (fail fast when cache missing)
+STRICT_LOCAL_CACHE = os.getenv("STRICT_LOCAL_CACHE", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
+WARMUP_ON_LOAD = os.getenv("WARMUP_ON_LOAD", "1").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
 os.environ.setdefault("RUNPOD_INIT_TIMEOUT", "800")
 
 _models: dict[str, Any] = {}
+_load_ms: dict[str, int] = {}
+_source_paths: dict[str, str] = {}
+_boot_started = time.perf_counter()
 
 
 def resolve_snapshot_path(model_id: str) -> str | None:
@@ -76,7 +89,6 @@ def resolve_snapshot_path(model_id: str) -> str | None:
                 log.info("Resolved %s -> %s (first snapshot)", model_id, chosen)
                 return chosen
 
-        # Baked flat checkout (files directly under org/name)
         if os.path.isdir(model_root) and any(
             os.path.isfile(os.path.join(model_root, f))
             for f in ("config.json", "model.safetensors", "model.safetensors.index.json")
@@ -91,7 +103,12 @@ def resolve_model_source(model_id: str) -> str:
     local = resolve_snapshot_path(model_id)
     if local:
         return local
-    log.warning("No local cache for %s — will download from Hub (slow cold start)", model_id)
+    msg = f"No local cache for {model_id} under {HF_CACHE_ROOT}"
+    if STRICT_LOCAL_CACHE:
+        raise FileNotFoundError(
+            f"{msg}. Attach RunPod cached model (CustomVoice) or set STRICT_LOCAL_CACHE=0."
+        )
+    log.warning("%s — will download from Hub (very slow cold start)", msg)
     return model_id
 
 
@@ -101,6 +118,30 @@ def _device() -> str:
 
 def _dtype() -> torch.dtype:
     return torch.bfloat16 if torch.cuda.is_available() else torch.float32
+
+
+def _warmup(mode: str, model: Any) -> None:
+    if not WARMUP_ON_LOAD:
+        return
+    try:
+        t0 = time.perf_counter()
+        if mode == "custom_voice":
+            model.generate_custom_voice(
+                text="Hi.",
+                language="English",
+                speaker="Ryan",
+            )
+        else:
+            model.generate_voice_design(
+                text="Hi.",
+                language="English",
+                instruct="Neutral male voice.",
+            )
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        log.info("Warmup %s done in %.0fms", mode, (time.perf_counter() - t0) * 1000)
+    except Exception:
+        log.exception("Warmup skipped for %s", mode)
 
 
 def _load_one(model_id: str) -> Any:
@@ -113,9 +154,10 @@ def _load_one(model_id: str) -> Any:
         "device_map": device,
         "dtype": dtype,
     }
-    # When loading from a local snapshot, avoid Hub round-trips.
     if source != model_id:
         kwargs["local_files_only"] = True
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
     if device.startswith("cuda"):
         try:
             import flash_attn  # noqa: F401
@@ -126,15 +168,23 @@ def _load_one(model_id: str) -> Any:
             log.info("flash-attn unavailable; default attention for %s", model_id)
 
     log.info("Loading %s from %s on %s (%s)...", model_id, source, device, dtype)
-    return Qwen3TTSModel.from_pretrained(source, **kwargs)
+    model = Qwen3TTSModel.from_pretrained(source, **kwargs)
+    return model, source
 
 
 def get_model(mode: str) -> Any:
     if mode in _models:
         return _models[mode]
     model_id = CUSTOM_VOICE_MODEL if mode == "custom_voice" else VOICE_DESIGN_MODEL
-    _models[mode] = _load_one(model_id)
-    return _models[mode]
+    t0 = time.perf_counter()
+    model, source = _load_one(model_id)
+    _warmup(mode, model)
+    elapsed = int((time.perf_counter() - t0) * 1000)
+    _models[mode] = model
+    _load_ms[mode] = elapsed
+    _source_paths[mode] = source
+    log.info("Model ready mode=%s load_ms=%s source=%s", mode, elapsed, source)
+    return model
 
 
 def preload() -> None:
@@ -165,9 +215,19 @@ def _wav_to_b64(wav: np.ndarray, sr: int) -> str:
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
+def _normalize_mode(mode: str) -> str | None:
+    mode = mode.strip().lower()
+    if mode in ("custom", "customvoice", "custom_voice"):
+        return "custom_voice"
+    if mode in ("design", "voicedesign", "voice_design"):
+        return "voice_design"
+    return None
+
+
 def handler(job: dict[str, Any]) -> dict[str, Any]:
+    t_job = time.perf_counter()
     inp = job.get("input") or {}
-    mode = str(inp.get("mode") or "custom_voice").strip().lower()
+    mode = _normalize_mode(str(inp.get("mode") or "custom_voice"))
     text = str(inp.get("text") or "").strip()
     language = str(inp.get("language") or "Auto").strip()
     instruct = str(inp.get("instruct") or "").strip()
@@ -175,21 +235,20 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
 
     if not text:
         return {"error": "text is required"}
-
-    if mode in ("custom", "customvoice", "custom_voice"):
-        mode = "custom_voice"
-    elif mode in ("design", "voicedesign", "voice_design"):
-        mode = "voice_design"
-    else:
+    if mode is None:
         return {"error": "mode must be 'custom_voice' or 'voice_design'"}
 
+    already_loaded = mode in _models
     try:
+        t_load = time.perf_counter()
         model = get_model(mode)
+        load_ms = 0 if already_loaded else int((time.perf_counter() - t_load) * 1000)
     except Exception as exc:
         log.exception("Model load failed")
         return {"error": f"Model load failed: {exc}"}
 
     try:
+        t_infer = time.perf_counter()
         if mode == "custom_voice":
             kwargs: dict[str, Any] = {
                 "text": text,
@@ -210,6 +269,11 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
             )
             meta = {"instruct": instruct}
 
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        infer_ms = int((time.perf_counter() - t_infer) * 1000)
+        total_ms = int((time.perf_counter() - t_job) * 1000)
+
         return {
             "mode": mode,
             "language": language,
@@ -217,6 +281,23 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
             "audio_base64": _wav_to_b64(wavs[0], sr),
             "format": "wav",
             "loaded_modes": list(_models),
+            "model_source": _source_paths.get(mode),
+            "cache_hit": bool(
+                _source_paths.get(mode)
+                and _source_paths[mode] != (
+                    CUSTOM_VOICE_MODEL if mode == "custom_voice" else VOICE_DESIGN_MODEL
+                )
+            ),
+            "timings_ms": {
+                "model_load": (
+                    0 if already_loaded else (load_ms or _load_ms.get(mode, 0))
+                ),
+                "model_load_at_boot": _load_ms.get(mode),
+                "infer": infer_ms,
+                "handler_total": total_ms,
+                "worker_uptime_s": int(time.perf_counter() - _boot_started),
+            },
+            "warm": already_loaded,
             **meta,
         }
     except Exception as exc:
@@ -224,8 +305,14 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
         return {"error": f"Synthesis failed: {exc}"}
 
 
-# Optional warm load at import (default: none → fastest container start)
+# Preload primary model before the worker accepts jobs (warm path).
 preload()
+log.info(
+    "Worker boot complete in %.0fms preload=%s loaded=%s",
+    (time.perf_counter() - _boot_started) * 1000,
+    PRELOAD_MODELS,
+    list(_models),
+)
 
 
 if __name__ == "__main__":

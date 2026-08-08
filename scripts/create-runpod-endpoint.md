@@ -1,89 +1,119 @@
-# RunPod Endpoint — cold-start optimized
+# RunPod Endpoint — cấu trúc tối ưu latency
 
 **Live endpoint ID:** `3gq6tivo3ms4ls`  
 Console: https://console.runpod.io/serverless/user/endpoint/3gq6tivo3ms4ls  
 Image: `ghcr.io/minhmarino/irodori-tts-worker:1.7b-dual`
 
-## Chiến lược chống cold start
+## Vì sao chậm (trước khi tối ưu)
 
-| Layer | Setting | Effect |
+| Nguyên nhân | Ảnh hưởng |
+|---|---|
+| `workersMin=0` + `idleTimeout=5` | Mỗi request sau vài giây = cold start đầy đủ |
+| Chưa gắn **Cached model** | Worker tải weights từ Hub (~phút) |
+| `PRELOAD_MODELS=none` | Request đầu còn phải load GPU |
+| GPU pool hẹp / host throttled | Job kẹt `IN_QUEUE` dù đã có worker |
+| 2 model trên 1 endpoint | RunPod **chỉ cache 1 model**/endpoint |
+
+## Cấu trúc khuyến nghị (latency)
+
+```text
+Client
+  → RunPod /run + poll
+      → Worker ấm (workersMin=1)
+          → CustomVoice đã preload + warmup
+          → Cache HF: Qwen3-TTS-12Hz-1.7B-CustomVoice
+          → VoiceDesign: lazy (chậm hơn nếu gọi lần đầu)
+```
+
+### Profile đang áp dụng
+
+| Setting | Giá trị | Mục đích |
 |---|---|---|
-| 1. Model cache | Attach **2** HF models trên endpoint | Worker start trên host đã có weights → bỏ bước tải GB |
-| 2. FlashBoot | `PRIORITY_FLASHBOOT` | Giữ container state, boot lại nhanh |
-| 3. Lazy load | `PRELOAD_MODELS=none` | Chỉ load model của `mode` đang gọi lên GPU |
-| 4. Idle keep-alive | `idleTimeout=300` | Worker ấm 5 phút giữa các request |
-| 5. Active worker | `workersMin=1` | **Loại bỏ** cold start (trả phí worker standby) |
+| `workersMin` | `1` | Bỏ cold start scale-to-zero |
+| `workersMax` | `2` | Spike nhẹ |
+| `idleTimeout` | `300` | Giữ worker sau request |
+| `flashboot` | `PRIORITY_FLASHBOOT` | Revive nhanh nếu scale |
+| `PRELOAD_MODELS` | `custom_voice` | Ready inference khi worker Ready |
+| `WARMUP_ON_LOAD` | `1` | Chạy 1 generate ngắn sau load |
+| Cached model (console) | **CustomVoice only** | Cache nhanh nhất (1 model/endpoint) |
+| GPU pools | AMPERE_24, ADA_24, AMPERE_48… | Giảm throttle |
 
-Khuyến nghị production latency-sensitive: bật **cả 1–5**.  
-Tiết kiệm chi phí: `workersMin=0` + giữ 1–4 (request đầu sau idle vẫn có cold start nhẹ: load GPU).
+### Tradeoff chi phí
 
-## Checklist trước deploy
+- `workersMin=1` = trả tiền standby GPU (nhanh, đắt hơn scale-to-zero).
+- Muốn rẻ lại: `workersMin=0`, `idleTimeout=120`, vẫn giữ cached model + FlashBoot.
 
-1. Nạp credit: https://console.runpod.io/user/billing  
-2. Public GHCR package: https://github.com/users/MinhMarino/packages/container/package/irodori-tts-worker  
+## BẮT BUỘC trên Console — Cached model
 
-## Model references (bắt buộc cho cache)
+MCP/API hiện **không** set được `modelReferences`. Làm tay:
 
-Trong console **New/Edit Endpoint → Model**, thêm cả hai:
+1. Mở https://console.runpod.io/serverless/user/endpoint/3gq6tivo3ms4ls  
+2. **Manage → Edit Endpoint → Model**  
+3. Thêm đúng **một** model (khuyến nghị primary):
 
+```text
+Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
 ```
+
+hoặc URL:
+
+```text
 https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
-https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign
 ```
 
-Hoặc CLI:
+4. Save.
 
-```bash
-runpodctl serverless create \
-  --name irodori-tts-1.7b-dual \
-  --image ghcr.io/minhmarino/irodori-tts-worker:1.7b-dual \
-  --gpu-id ADA_24 \
-  --gpu-id AMPERE_24 \
-  --gpu-id AMPERE_48 \
-  --workers-min 1 \
-  --workers-max 3 \
-  --idle-timeout 300 \
-  --flash-boot true \
-  --execution-timeout 300 \
-  --model-reference https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice:main \
-  --model-reference https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign:main \
-  --env PRELOAD_MODELS=none \
-  --env RUNPOD_INIT_TIMEOUT=800
+> VoiceDesign không cache trên cùng endpoint. Lần đầu gọi `voice_design` có thể chậm (download/load model 2). Nếu cần VoiceDesign nhanh: tạo endpoint thứ 2 chỉ cache VoiceDesign.
+
+## Checklist deploy image mới
+
+1. Push `worker/**` → GitHub Actions build `ghcr.io/minhmarino/irodori-tts-worker:1.7b-dual`
+2. Package GHCR public (nếu pull lỗi)
+3. Endpoint env:
+
+```env
+PRELOAD_MODELS=custom_voice
+WARMUP_ON_LOAD=1
+STRICT_LOCAL_CACHE=0
+CUSTOM_VOICE_MODEL=Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+VOICE_DESIGN_MODEL=Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign
+HF_CACHE_ROOT=/runpod-volume/huggingface-cache/hub
+RUNPOD_INIT_TIMEOUT=800
 ```
 
-## Cấu hình tối ưu (MCP / API v2)
+4. Gắn Cached model CustomVoice (bước trên)
+5. Test 2 lần liên tiếp: lần 2 phải `warm: true`, `timings_ms.infer` vài giây, `delayTime` thấp
 
-- **image**: `ghcr.io/minhmarino/irodori-tts-worker:1.7b-dual`
-- **type**: QUEUE
-- **gpuPoolIds**: `ADA_24`, `AMPERE_24`, `AMPERE_48`
-- **workersMin**: `1` (zero cold start) hoặc `0` (rẻ hơn)
-- **workersMax**: `3`
-- **idleTimeout**: `300`
-- **flashboot**: `PRIORITY_FLASHBOOT`
-- **containerDiskInGb**: `20` (không cần lớn nếu dùng model cache)
-- **executionTimeoutMs**: `300000`
-- **scalerValue**: `2`
-- **env**:
-  - `PRELOAD_MODELS=none`
-  - `CUSTOM_VOICE_MODEL=Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`
-  - `VOICE_DESIGN_MODEL=Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign`
-  - `HF_CACHE_ROOT=/runpod-volume/huggingface-cache/hub`
-  - `RUNPOD_INIT_TIMEOUT=800`
+## Kỳ vọng latency
 
-> MCP `create-endpoint` hiện chưa expose `modelReferences` — sau khi tạo endpoint, vào console thêm 2 model URLs (hoặc dùng `runpodctl` như trên).
+| Tình huống | Kỳ vọng |
+|---|---|
+| Worker ấm + model preload + cache | **~3–15s** end-to-end (chủ yếu infer) |
+| Cold scale từ 0, có cache | ~20–60s (boot + load GPU) |
+| Không cache, tải Hub | **1–3+ phút** (tránh) |
+| Host throttled | Queue lâu — thêm GPU pool / đổi region |
 
-## Tradeoff chi phí
+Response worker có thêm:
 
-- `workersMin=1` trên RTX 4090-class: worker standby luôn chạy (giá standby thấp hơn active inference, vẫn > $0 khi không traffic).
-- `workersMin=0` + FlashBoot + model cache: request đầu sau scale-to-zero ~ vài–chục giây (load GPU), không còn tải model từ internet.
+```json
+{
+  "warm": true,
+  "cache_hit": true,
+  "timings_ms": {
+    "model_load": 0,
+    "infer": 7900,
+    "handler_total": 8100
+  }
+}
+```
 
 ## Test
 
 ```bash
-export ENDPOINT_ID=...
+export ENDPOINT_ID=3gq6tivo3ms4ls
 export RUNPOD_API_KEY=...
 
-curl -sS -X POST "https://api.runpod.ai/v2/$ENDPOINT_ID/runsync" \
+curl -sS -X POST "https://api.runpod.ai/v2/$ENDPOINT_ID/run" \
   -H "Authorization: Bearer $RUNPOD_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
