@@ -69,4 +69,12 @@ curl -X POST http://localhost:8000/api/synthesize \
 | NVIDIA GPU | Nên dùng `TTS_DEVICE=cuda` + flash-attn |
 | RAM khuyến nghị | ≥ 8GB trống khi load 0.6B |
 
-Model: [`Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice`](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice)
+Model (local Docker UI): [`Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice`](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice)
+
+## RunPod Serverless (1.7B CustomVoice + VoiceDesign)
+
+Worker code: [`worker/`](worker/). Image builds via GitHub Actions to:
+
+`ghcr.io/minhmarino/irodori-tts-worker:1.7b-dual`
+
+See [worker/README.md](worker/README.md) for API payload examples.
