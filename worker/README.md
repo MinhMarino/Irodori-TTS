@@ -4,6 +4,8 @@ Serverless worker for **Qwen3-TTS 12Hz 1.7B** — CustomVoice (primary) + VoiceD
 
 Latency guide: [`scripts/create-runpod-endpoint.md`](../scripts/create-runpod-endpoint.md).
 
+**GPU note:** image is PyTorch 2.4 — pin endpoint to `ADA_24` (4090). Blackwell MIG (e.g. RTX PRO 6000 MIG 1g.24gb) fails with `CUDA error: no kernel image is available for execution on the device`.
+
 ## Architecture (fast path)
 
 1. Endpoint keeps **1 warm worker** (`workersMin=1`).

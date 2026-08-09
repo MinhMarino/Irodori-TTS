@@ -36,7 +36,7 @@ Client
 | `PRELOAD_MODELS` | `custom_voice` | Ready inference khi worker Ready |
 | `WARMUP_ON_LOAD` | `1` | Chạy 1 generate ngắn sau load |
 | Cached model (console) | **CustomVoice only** | Cache nhanh nhất (1 model/endpoint) |
-| GPU pools | AMPERE_24, ADA_24, AMPERE_48… | Giảm throttle |
+| GPU pools | **`ADA_24` only (RTX 4090)** | Tránh Blackwell MIG (PyTorch 2.4 không chạy được) |
 
 ### Tradeoff chi phí
 
